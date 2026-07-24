@@ -60,6 +60,18 @@
   }
   input:focus { outline: none; border-color: #58a6ff; }
 
+  .section-divider { border-top: 1px solid #1f2937; margin: 28px 0 20px; }
+  .section-heading { font-size: 15px; font-weight: 600; color: #e6edf3; margin-bottom: 4px; }
+  .section-sub { font-size: 12px; color: #7d8590; line-height: 1.4; margin-bottom: 16px; }
+
+  .toggle-row { display: flex; gap: 8px; margin-bottom: 16px; }
+  .toggle-btn {
+    flex: 1; padding: 10px; border-radius: 8px; border: 1px solid #374151;
+    background: #161b22; color: #9ca3af; font-size: 13px; font-weight: 600;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .toggle-btn.active { background: rgba(88,166,255,0.15); border-color: #58a6ff; color: #cfe3ff; }
+
   .results {
     margin-top: 24px; padding: 20px;
     background: linear-gradient(180deg, #0d1117 0%, #10151d 100%);
@@ -212,6 +224,47 @@
 
   <div id="warning-box"></div>
 
+  <div class="section-divider"></div>
+
+  <div class="section-heading">Required VTOSS for a Given Distance</div>
+  <div class="section-sub">Reverse lookup: enter the distance you have available and the wind, and this finds the VTOSS that distance supports &mdash; the fastest planning speed for that runway/pad and wind.</div>
+
+  <div class="toggle-row">
+    <button class="toggle-btn active" id="rev-d1-btn" onclick="setRevTarget('D1')">D1 &middot; Rejected T/O</button>
+    <button class="toggle-btn" id="rev-d2-btn" onclick="setRevTarget('D2')">D2 &middot; Clear 35 ft</button>
+  </div>
+
+  <div class="input-group">
+    <div class="input-label">Available Distance (m)</div>
+    <div class="input-row">
+      <button class="stepper" onclick="adjust('rev-dist', -10, computeReverse)" aria-label="Decrease distance">&minus;</button>
+      <input type="number" id="rev-dist" value="400" step="10" min="0" inputmode="numeric" pattern="[0-9]*" />
+      <button class="stepper" onclick="adjust('rev-dist', 10, computeReverse)" aria-label="Increase distance">+</button>
+    </div>
+  </div>
+
+  <div class="input-group">
+    <div class="input-label">Wind (kt, headwind)</div>
+    <div class="input-row">
+      <button class="stepper" onclick="adjust('rev-wind', -1, computeReverse)" aria-label="Decrease wind">&minus;</button>
+      <input type="number" id="rev-wind" value="0" step="1" min="0" max="50" inputmode="numeric" pattern="[0-9]*" />
+      <button class="stepper" onclick="adjust('rev-wind', 1, computeReverse)" aria-label="Increase wind">+</button>
+    </div>
+  </div>
+
+  <div class="results">
+    <div class="result-label">Required VTOSS</div>
+    <div class="result-label-sub" id="rev-sub">Slowest VTOSS this distance supports (rejected T/O)</div>
+    <div class="distances" id="rev-out">
+      <div class="dist-block">
+        <div class="dist-value" id="rev-vtoss">&mdash;</div>
+        <div class="dist-unit">kt</div>
+      </div>
+    </div>
+  </div>
+
+  <div id="rev-warning-box"></div>
+
   <div class="info">
     <strong>Source:</strong> EC225 LP Flight Manual, Fig 21 MAKILA 2A1, Section CAT.A.A1 &middot; Determination of Distances (D1, D2). Digitized from the printed chart; VTOSS 20&ndash;80 kt, wind 0&ndash;50 kt headwind. Bilinear interpolation between chart points. D3 (path slope) is not included in this tool.
   </div>
@@ -357,7 +410,7 @@
       : '';
   }
 
-  function adjust(id, delta) {
+  function adjust(id, delta, fn) {
     const el = document.getElementById(id);
     let val = (parseFloat(el.value) || 0) + delta;
     const min = parseFloat(el.min);
@@ -365,13 +418,116 @@
     if (!isNaN(min) && val < min) val = min;
     if (!isNaN(max) && val > max) val = max;
     el.value = val;
-    compute();
+    (fn || compute)();
+  }
+
+  // --- Required VTOSS reverse lookup ---------------------------------------
+  // Given a target D1 or D2 distance and a wind, find the VTOSS that
+  // produces that distance. D1/D2 both increase monotonically with VTOSS at
+  // any fixed wind (verified against the full digitized table), so this
+  // walks the VTOSS grid at the (interpolated) wind, finds the bracketing
+  // pair of grid points whose distances straddle the target, and linearly
+  // interpolates VTOSS within that bracket -- the inverse of the same
+  // bilinear lookup used for the forward D1/D2 calculator above.
+  let revTarget = 'D1';
+
+  function setRevTarget(t) {
+    revTarget = t;
+    document.getElementById('rev-d1-btn').classList.toggle('active', t === 'D1');
+    document.getElementById('rev-d2-btn').classList.toggle('active', t === 'D2');
+    document.getElementById('rev-sub').textContent = t === 'D1'
+      ? 'Slowest VTOSS this distance supports (rejected T/O)'
+      : 'Slowest VTOSS this distance supports (clear 35 ft)';
+    computeReverse();
+  }
+
+  function distanceAtVtoss(table, vtoss, wind) {
+    // Same bilinear interpolation as the forward lookup, but exposed as a
+    // plain function of VTOSS at a fixed wind so it can be walked/inverted.
+    return bilinear(table, vtoss, wind);
+  }
+
+  function solveVtoss(table, targetDist, wind) {
+    const wClamped = Math.max(WIND_GRID[0], Math.min(WIND_GRID[WIND_GRID.length - 1], wind));
+
+    // Distance at every VTOSS grid point, at this (possibly interpolated) wind.
+    const distAtGrid = VTOSS_GRID.map(v => distanceAtVtoss(table, v, wClamped));
+
+    const dMin = distAtGrid[0];
+    const dMax = distAtGrid[distAtGrid.length - 1];
+
+    if (targetDist <= dMin) {
+      // At or below the shortest charted distance -- return the lowest VTOSS
+      // on the grid (the chart floors out here; can't resolve a slower VTOSS).
+      return { vtoss: VTOSS_GRID[0], outOfRange: targetDist < dMin };
+    }
+    if (targetDist >= dMax) {
+      return { vtoss: VTOSS_GRID[VTOSS_GRID.length - 1], outOfRange: targetDist > dMax };
+    }
+
+    // Find the bracketing pair of VTOSS grid points whose distances straddle
+    // the target (distances are monotonic non-decreasing in VTOSS, so the
+    // first bracket found is the only one).
+    for (let i = 0; i < distAtGrid.length - 1; i++) {
+      const d1 = distAtGrid[i], d2 = distAtGrid[i + 1];
+      if (targetDist >= d1 && targetDist <= d2) {
+        if (d2 === d1) {
+          // Flat stretch (chart plateaus at its minimum) -- take the lower,
+          // more conservative VTOSS rather than an arbitrary point in the plateau.
+          return { vtoss: VTOSS_GRID[i], outOfRange: false };
+        }
+        const frac = (targetDist - d1) / (d2 - d1);
+        const vtoss = VTOSS_GRID[i] + frac * (VTOSS_GRID[i + 1] - VTOSS_GRID[i]);
+        return { vtoss: Math.round(vtoss * 10) / 10, outOfRange: false };
+      }
+    }
+    // Should not be reached given the dMin/dMax checks above.
+    return { vtoss: null, outOfRange: true };
+  }
+
+  function computeReverse() {
+    const distEl = document.getElementById('rev-dist');
+    const windEl = document.getElementById('rev-wind');
+    const vtossEl = document.getElementById('rev-vtoss');
+    const warnEl = document.getElementById('rev-warning-box');
+
+    const targetDist = parseFloat(distEl.value);
+    const wind = parseFloat(windEl.value);
+
+    if (isNaN(targetDist) || isNaN(wind) || targetDist < 0) {
+      vtossEl.textContent = '—';
+      warnEl.innerHTML = '';
+      return;
+    }
+
+    const windOutOfRange = (wind < 0 || wind > 50);
+    const wClamped = Math.max(0, Math.min(50, wind));
+
+    const table = revTarget === 'D1' ? D1 : D2;
+    const result = solveVtoss(table, targetDist, wClamped);
+
+    vtossEl.textContent = result.vtoss !== null ? fmt(result.vtoss) : '—';
+    vtossEl.classList.toggle('flagged', result.outOfRange || windOutOfRange);
+
+    const warnings = [];
+    if (windOutOfRange) {
+      warnings.push('Wind outside charted range (0–50 kt) — result clamped to chart edge, not a true reading');
+    }
+    if (result.outOfRange) {
+      warnings.push('Distance outside what the charted VTOSS range (20–80 kt) can produce at this wind — result clamped to chart edge, not a true reading');
+    }
+    warnEl.innerHTML = warnings.length
+      ? '<div class="warning">' + warnings.map(w => '• ' + w).join('<br>') + '</div>'
+      : '';
   }
 
   document.getElementById('vtoss').addEventListener('input', compute);
   document.getElementById('wind').addEventListener('input', compute);
-  document.addEventListener('DOMContentLoaded', compute);
+  document.getElementById('rev-dist').addEventListener('input', computeReverse);
+  document.getElementById('rev-wind').addEventListener('input', computeReverse);
+  document.addEventListener('DOMContentLoaded', function() { compute(); computeReverse(); });
   compute();
+  computeReverse();
 
   if ('serviceWorker' in navigator) {
     window.addEventListener('load', function() {
