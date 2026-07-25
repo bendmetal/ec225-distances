@@ -1,7 +1,7 @@
 // EC225 Takeoff Distances (D1/D2) - Service Worker
 // Caches the app for full offline use after first load
 
-const CACHE_NAME = 'ec225-distances-v2';
+const CACHE_NAME = 'ec225-distances-v3';
 const FILES_TO_CACHE = [
   './',
   './index.html'
